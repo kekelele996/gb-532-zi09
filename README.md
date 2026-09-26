@@ -83,6 +83,7 @@ database/init.sql        PostGIS 扩展初始化
 | POST | `/plans/generate` | 从测区生成平行测线 |
 | PUT | `/plans/:id` | 更新草稿规划 |
 | POST | `/plans/:id/transition` | 锁定规划 |
+| POST | `/plans/:id/detour` | 为单条测线安排两处折点的礁区绕行 |
 | POST | `/plans/:id/copy` | 复制新版本 |
 | GET | `/runs`、`/runs/:id` | 运行列表与详情 |
 | POST | `/runs/import` | 导入航迹，按 checksum 幂等 |
@@ -94,6 +95,15 @@ database/init.sql        PostGIS 扩展初始化
 | GET | `/audits` | 审计筛选 |
 
 错误响应统一包含业务 `code`、`message`、可选 `details` 和 `request_id`。无效 GeoJSON/坐标系返回 422，非法状态或版本冲突返回 409，认证与权限分别返回 401/403。
+
+## 礁区绕行折线
+
+草稿规划在 `/plans` 页通过“礁区绕行”先选一条测线、再在画布上点选两处折点（米制投影坐标）。折点按其在原测线投影轴上的位置自动排序，原直线被替换为 `起点…P1…P2…终点` 的折线，其他测线、线间距和计划扫幅保持不变，规划版本递增并写入 `plan.detour` 审计。已安排绕行的测线在要素 `properties.detours` 中记录折点，并以安全橙实线绘制。
+
+- 两处折点必须落在测区边界内（含边界、不含孔洞内部），否则返回 422 `DETOUR_OUTSIDE_AREA`；折点重合返回 422 `DETOUR_VERTEX_DUPLICATE`。
+- 绕行段与任何相邻测线相交（含端点相接、共线重叠）时返回 422 `DETOUR_CONFLICT`，`details` 给出冲突测线索引、绕行段序号和交点米制坐标，原几何与版本原样保留。
+- 已锁定规划不能绕行（409 `PLAN_LOCKED`）；锁定后复制的新草稿保留绕行折点，可继续调整，原锁定版本仍不可修改。
+
 
 ## 共享枚举位置
 
@@ -181,6 +191,7 @@ docker compose down -v --remove-orphans
 - `COORDINATE_SYSTEM_INVALID`：把经纬度转换为项目约定的米制投影坐标后重新创建测区。
 - `VERSION_CONFLICT`：数据已被其他人员更新，刷新列表后按新版本重试。
 - `RUN_TRANSITION_INVALID`：必须依次完成质量检查、处理和已处理状态。
+- `DETOUR_CONFLICT`：绕行折线碰到相邻测线，响应 `details.intersection` 给出交点；把两处折点移回本测线与相邻测线之间的条带后重试。
 - `RUN_NOT_PROCESSED`：覆盖计算只能选择已处理且属于同一测区的运行。
 - npm 默认镜像无法下载或审计：显式使用 `--registry=https://registry.npmjs.org --replace-registry-host=always`。
 

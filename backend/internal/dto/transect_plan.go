@@ -33,6 +33,20 @@ type PlanTransitionRequest struct {
 	ExpectedVersion uint   `json:"expected_version" binding:"required,gt=0"`
 }
 
+// DetourPoint 是绕行折点的米制投影坐标（不接受经纬度）。
+type DetourPoint struct {
+	X *float64 `json:"x"`
+	Y *float64 `json:"y"`
+}
+
+// ApplyDetourRequest 在指定测线上安排两处绕行折点。
+type ApplyDetourRequest struct {
+	LineIndex       int          `json:"line_index"`
+	FirstVertex     *DetourPoint `json:"first_vertex"`
+	SecondVertex    *DetourPoint `json:"second_vertex"`
+	ExpectedVersion uint         `json:"expected_version" binding:"required,gt=0"`
+}
+
 type TransectPlanQuery struct {
 	SurveyAreaID uint
 	State        string

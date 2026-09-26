@@ -1,11 +1,14 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/paulmach/orb"
+	"github.com/paulmach/orb/geojson"
 	"gorm.io/datatypes"
 
 	"sonar-survey-coverage-planner/backend/internal/constants"
@@ -146,6 +149,242 @@ func (s *TransectPlanService) Copy(id uint, actor Actor) (model.TransectPlan, er
 		return copy, err
 	}
 	return copy, nil
+}
+
+// ApplyDetour 在草稿规划的指定测线上用两处折点替换直线段。
+// 仅更新 line_geojson 与版本号，其他测线、线间距和计划扫幅保持不变；
+// 折点必须落在测区内，绕行段触碰相邻测线时拒绝保存并保留原几何。
+func (s *TransectPlanService) ApplyDetour(id uint, request dto.ApplyDetourRequest, actor Actor) (model.TransectPlan, error) {
+	before, err := s.Get(id)
+	if err != nil {
+		return model.TransectPlan{}, err
+	}
+	if before.PlanState != constants.PlanDraft {
+		return model.TransectPlan{}, api.Conflict("PLAN_LOCKED", "已锁定规划不能安排绕行，请先复制为新草稿", nil)
+	}
+	first, err := parseDetourPoint(request.FirstVertex)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("DETOUR_POINT_INVALID", "第一处折点坐标无效", err)
+	}
+	second, err := parseDetourPoint(request.SecondVertex)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("DETOUR_POINT_INVALID", "第二处折点坐标无效", err)
+	}
+	area := before.SurveyArea
+	if area == nil {
+		loaded, loadErr := s.areas.Get(before.SurveyAreaID)
+		if loadErr != nil {
+			return model.TransectPlan{}, mapDatabaseError(loadErr, "测区")
+		}
+		area = &loaded
+	}
+	boundary, err := geometry.ParsePolygon(area.BoundaryGeoJSON)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("GEOJSON_INVALID", "测区边界无法校验绕行折点", err)
+	}
+	for _, candidate := range []struct {
+		label string
+		point orb.Point
+	}{
+		{label: "第一处折点", point: first},
+		{label: "第二处折点", point: second},
+	} {
+		if !geometry.PointInsideOrOnBoundary(boundary, candidate.point) {
+			return model.TransectPlan{}, unprocessableWithDetails("DETOUR_OUTSIDE_AREA", candidate.label+"必须落在测区边界内", map[string]any{"vertex": candidate.point})
+		}
+	}
+	if distance2D(first, second) == 0 {
+		return model.TransectPlan{}, unprocessableWithDetails("DETOUR_VERTEX_DUPLICATE", "两处折点不能重合", map[string]any{"vertex": first})
+	}
+
+	feature, err := geojson.UnmarshalFeature(before.LineGeoJSON)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("GEOJSON_INVALID", "当前测线几何无法解析", err)
+	}
+	lines, err := geometry.ParseLines(before.LineGeoJSON)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("GEOJSON_INVALID", "当前测线几何无效", err)
+	}
+	if request.LineIndex < 0 || request.LineIndex >= len(lines) {
+		return model.TransectPlan{}, api.BadRequest("DETOUR_LINE_NOT_FOUND",
+			fmt.Sprintf("测线索引 %d 不存在，当前规划共有 %d 条测线", request.LineIndex, len(lines)), nil)
+	}
+	target := lines[request.LineIndex]
+	replaced, err := geometry.OrderedDetourLine(target, first, second)
+	if err != nil {
+		return model.TransectPlan{}, api.Unprocessable("DETOUR_LINE_INVALID", "所选测线无法安排绕行", err)
+	}
+
+	originalSegments := segmentSet(target)
+	detourSegments := make([][2]orb.Point, 0, len(replaced)-1)
+	for index := 1; index < len(replaced); index++ {
+		segment := [2]orb.Point{replaced[index-1], replaced[index]}
+		if _, exists := originalSegments[segmentKey(segment[0], segment[1])]; !exists {
+			detourSegments = append(detourSegments, segment)
+		}
+	}
+	for otherIndex, other := range lines {
+		if otherIndex == request.LineIndex {
+			continue
+		}
+		for segmentIndex := 1; segmentIndex < len(other); segmentIndex++ {
+			for detourIndex, detourSegment := range detourSegments {
+				if intersection, intersects := geometry.SegmentIntersection(detourSegment[0], detourSegment[1], other[segmentIndex-1], other[segmentIndex]); intersects {
+					return model.TransectPlan{}, unprocessableWithDetails("DETOUR_CONFLICT",
+						fmt.Sprintf("绕行段与第 %d 条相邻测线相交，已拒绝保存", otherIndex+1),
+						map[string]any{
+							"target_line_index":   request.LineIndex,
+							"conflict_line_index": otherIndex,
+							"detour_segment":      detourIndex + 1,
+							"intersection":        intersection,
+						})
+				}
+			}
+		}
+	}
+
+	updatedLines := make(orb.MultiLineString, len(lines))
+	copy(updatedLines, lines)
+	updatedLines[request.LineIndex] = replaced
+	feature.Geometry = updatedLines
+	if feature.Properties == nil {
+		feature.Properties = geojson.Properties{}
+	}
+	detours := readDetourProperties(feature.Properties)
+	orderedVertices := orderedDetourVertices(replaced, target, first, second)
+	detours[request.LineIndex] = orderedVertices
+	feature.Properties["detours"] = detourMapForJSON(detours)
+	encoded, err := feature.MarshalJSON()
+	if err != nil {
+		return model.TransectPlan{}, fmt.Errorf("encode detour feature: %w", err)
+	}
+	updated, err := s.repository.Update(id, request.ExpectedVersion, map[string]any{"line_geojson": json.RawMessage(encoded)})
+	if err != nil {
+		return model.TransectPlan{}, mapDatabaseError(err, "测线规划")
+	}
+	if err := s.audit.Record(actor, "plan.detour", "transect_plan", id, before, updated, map[string]any{
+		"line_index":       request.LineIndex,
+		"detour_vertices":  orderedVertices,
+		"expected_version": request.ExpectedVersion,
+	}); err != nil {
+		return updated, err
+	}
+	return updated, nil
+}
+
+func parseDetourPoint(point *dto.DetourPoint) (orb.Point, error) {
+	if point == nil || point.X == nil || point.Y == nil {
+		return orb.Point{}, fmt.Errorf("x and y are required")
+	}
+	if math.IsNaN(*point.X) || math.IsInf(*point.X, 0) || math.IsNaN(*point.Y) || math.IsInf(*point.Y, 0) {
+		return orb.Point{}, fmt.Errorf("coordinates must be finite")
+	}
+	return orb.Point{*point.X, *point.Y}, nil
+}
+
+// segmentSet 记录原线段的无向键，用于区分绕行新增段与原直线段。
+func segmentSet(line orb.LineString) map[string]struct{} {
+	segments := make(map[string]struct{}, len(line)-1)
+	for index := 1; index < len(line); index++ {
+		segments[segmentKey(line[index-1], line[index])] = struct{}{}
+	}
+	return segments
+}
+
+func segmentKey(start, end orb.Point) string {
+	first, second := start, end
+	if start[0] > end[0] || start[0] == end[0] && start[1] > end[1] {
+		first, second = end, start
+	}
+	return fmt.Sprintf("%.6f:%.6f|%.6f:%.6f", first[0], first[1], second[0], second[1])
+}
+
+// readDetourProperties 读取已保存的折点信息，键为测线索引。
+func readDetourProperties(properties geojson.Properties) map[int][]orb.Point {
+	detours := map[int][]orb.Point{}
+	raw, ok := properties["detours"]
+	if !ok {
+		return detours
+	}
+	entries, ok := raw.(map[string]any)
+	if !ok {
+		return detours
+	}
+	indices := make([]int, 0, len(entries))
+	for key := range entries {
+		var index int
+		if _, err := fmt.Sscanf(key, "%d", &index); err == nil {
+			indices = append(indices, index)
+		}
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		points, ok := entries[fmt.Sprintf("%d", index)].([]any)
+		if !ok || len(points) != 2 {
+			continue
+		}
+		vertices := make([]orb.Point, 0, 2)
+		for _, candidate := range points {
+			coordinates, ok := candidate.([]any)
+			if !ok || len(coordinates) < 2 {
+				vertices = nil
+				break
+			}
+			x, xOK := coordinates[0].(float64)
+			y, yOK := coordinates[1].(float64)
+			if !xOK || !yOK {
+				vertices = nil
+				break
+			}
+			vertices = append(vertices, orb.Point{x, y})
+		}
+		if len(vertices) == 2 {
+			detours[index] = vertices
+		}
+	}
+	return detours
+}
+
+func detourMapForJSON(detours map[int][]orb.Point) map[string][][2]float64 {
+	result := make(map[string][][2]float64, len(detours))
+	for index, vertices := range detours {
+		pairs := make([][2]float64, 0, len(vertices))
+		for _, vertex := range vertices {
+			pairs = append(pairs, [2]float64{vertex[0], vertex[1]})
+		}
+		result[fmt.Sprintf("%d", index)] = pairs
+	}
+	return result
+}
+
+func distance2D(a, b orb.Point) float64 {
+	return math.Hypot(a[0]-b[0], a[1]-b[1])
+}
+
+// orderedDetourVertices 从替换折线中提取两处折点并保持沿测线方向的顺序；
+// 提取失败时回退为按投影排序的输入折点。
+func orderedDetourVertices(replaced, target orb.LineString, first, second orb.Point) []orb.Point {
+	original := make(map[orb.Point]struct{}, len(target))
+	for _, point := range target {
+		original[point] = struct{}{}
+	}
+	vertices := make([]orb.Point, 0, 2)
+	for _, point := range replaced {
+		if _, exists := original[point]; !exists {
+			vertices = append(vertices, point)
+		}
+	}
+	if len(vertices) == 2 {
+		return vertices
+	}
+	return []orb.Point{first, second}
+}
+
+// unprocessableWithDetails 构造 422 业务错误并附带结构化细节（如冲突交点）。
+func unprocessableWithDetails(code, message string, details map[string]any) error {
+	appErr := api.Unprocessable(code, message, nil)
+	appErr.Details = details
+	return appErr
 }
 
 func bounds(polygon orb.Polygon) (float64, float64, float64, float64) {
