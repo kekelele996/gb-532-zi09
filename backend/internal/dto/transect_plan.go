@@ -33,6 +33,17 @@ type PlanTransitionRequest struct {
 	ExpectedVersion uint   `json:"expected_version" binding:"required,gt=0"`
 }
 
+type DetourVertexRequest struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+type ApplyDetourRequest struct {
+	LineIndex       int                   `json:"line_index" binding:"min=0"`
+	Vertices        []DetourVertexRequest `json:"vertices" binding:"required,len=2,dive"`
+	ExpectedVersion uint                  `json:"expected_version" binding:"required,gt=0"`
+}
+
 type TransectPlanQuery struct {
 	SurveyAreaID uint
 	State        string

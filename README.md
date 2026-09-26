@@ -9,7 +9,7 @@ docker compose up -d --build
 ## 主要功能
 
 - 测区：创建、校验米制投影边界，查看规划、运行和覆盖摘要。
-- 测线：从测区生成平行测线，锁定执行版本，复制形成后续草稿。
+- 测线：从测区生成平行测线，在草稿上为穿过礁区的单条直线安排两处绕行折点（折点必须位于测区内，绕行段碰到相邻测线会被拒绝），锁定执行版本，复制形成后续草稿。
 - 航迹：导入 GeoJSON，检查采样点、长度、航速与导航质量，按状态机处理。
 - 覆盖：以固定网格估算覆盖、重复覆盖和漏测，冻结输入哈希并生成补测线建议。
 - 审计：记录四类实体写操作的前后快照、操作者、角色、request ID 和算法元数据。
@@ -33,7 +33,7 @@ docker compose up -d --build
 | 路径 | 主要实体 | 交互 |
 | --- | --- | --- |
 | `/areas` | SurveyArea、TransectPlan | 创建投影测区、查看覆盖摘要和边界 |
-| `/plans` | TransectPlan、SurveyArea | 生成平行测线、锁定或复制版本 |
+| `/plans` | TransectPlan、SurveyArea | 生成平行测线、安排礁区绕行折点、锁定或复制版本 |
 | `/runs` | SonarRun、TransectPlan | 导入航迹、读取质量证据、推进处理状态 |
 | `/coverage` | CoverageGap、SonarRun、SurveyArea | 计算覆盖、查看缺口与补测线、人工复核 |
 | `/audit` | 四实体审计投影 | 按 request ID、实体和操作者筛选 |
@@ -82,6 +82,7 @@ database/init.sql        PostGIS 扩展初始化
 | GET/POST | `/plans` | 规划列表与手工创建 |
 | POST | `/plans/generate` | 从测区生成平行测线 |
 | PUT | `/plans/:id` | 更新草稿规划 |
+| POST | `/plans/:id/detour` | 为单条直线应用两处绕行折点，乐观锁版本递增 |
 | POST | `/plans/:id/transition` | 锁定规划 |
 | POST | `/plans/:id/copy` | 复制新版本 |
 | GET | `/runs`、`/runs/:id` | 运行列表与详情 |
@@ -113,6 +114,7 @@ database/init.sql        PostGIS 扩展初始化
 - 边界和航迹使用结构化 GeoJSON 解析；固定夹具测试覆盖 Polygon、MultiLineString、面积和稳定哈希。
 - 当前算法以目标分辨率构造有限网格，用点到线段距离近似扫幅覆盖，计算覆盖率、重叠率和漏测率。
 - 小于分辨率阈值的碎片会在解释中计数；补测线沿缺口包围盒主方向生成。
+- 绕行折点按其在目标直线上的投影自动排序，折点严格在测区内才接受；绕行三段（起点—折点 1—折点 2—终点）与任何相邻测线相交、端点接触或共线重叠都会返回 409 冲突坐标，原几何与版本保留不变。
 - 结果是离线规划近似，不替代水深、海况、导航误差和持证测绘人员判断，也不能下发船舶控制。
 
 ## 环境变量与端口
@@ -182,6 +184,9 @@ docker compose down -v --remove-orphans
 - `VERSION_CONFLICT`：数据已被其他人员更新，刷新列表后按新版本重试。
 - `RUN_TRANSITION_INVALID`：必须依次完成质量检查、处理和已处理状态。
 - `RUN_NOT_PROCESSED`：覆盖计算只能选择已处理且属于同一测区的运行。
+- `DETOUR_VERTEX_OUTSIDE_AREA`：绕行折点必须严格位于测区内部（边界上不允许），重新在画布上拾取两点。
+- `DETOUR_LINE_CONFLICT`：绕行段在返回坐标处与相邻测线相交或接触，保存已被拒绝且原几何保留；调整折点使绕行段避开邻线后重试。
+- `PLAN_LOCKED`：已锁定规划不可修改，先“复制版本”得到新草稿（绕行折点会一并保留）再安排绕行。
 - npm 默认镜像无法下载或审计：显式使用 `--registry=https://registry.npmjs.org --replace-registry-host=always`。
 
 ## License

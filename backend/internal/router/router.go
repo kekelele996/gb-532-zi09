@@ -51,6 +51,7 @@ func New(log *slog.Logger, auth *service.AuthService, handlers Handlers) *gin.En
 	protected.POST("/plans/generate", middleware.RBAC(constants.RoleAdmin, constants.RoleSurveyPlanner), handlers.Plan.Generate)
 	protected.PUT("/plans/:id", middleware.RBAC(constants.RoleAdmin, constants.RoleSurveyPlanner), handlers.Plan.Update)
 	protected.POST("/plans/:id/transition", middleware.RBAC(constants.RoleAdmin, constants.RoleSurveyPlanner), handlers.Plan.Lock)
+	protected.POST("/plans/:id/detour", middleware.RBAC(constants.RoleAdmin, constants.RoleSurveyPlanner), handlers.Plan.Detour)
 	protected.POST("/plans/:id/copy", middleware.RBAC(constants.RoleAdmin, constants.RoleSurveyPlanner), handlers.Plan.Copy)
 
 	protected.GET("/runs", handlers.Run.List)

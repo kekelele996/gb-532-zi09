@@ -96,6 +96,23 @@ func (h *TransectPlanHandler) Lock(c *gin.Context) {
 	}
 	api.Success(c, http.StatusOK, item)
 }
+func (h *TransectPlanHandler) Detour(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	var request dto.ApplyDetourRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		api.BindError(c, err)
+		return
+	}
+	item, err := h.service.Detour(id, request, actorFrom(c))
+	if err != nil {
+		writeServiceError(c, err, "测线规划")
+		return
+	}
+	api.Success(c, http.StatusOK, item)
+}
 func (h *TransectPlanHandler) Copy(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {

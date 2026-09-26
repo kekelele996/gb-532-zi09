@@ -5,8 +5,9 @@ import { geometryBounds, geometryLines } from '../../utils/geometry'
 
 export interface MapLayer{feature:GeoJSONFeature;label:string;color:string;fill?:string;width?:number;dash?:number[]}
 
-export function SurveyCanvas({layers,ariaLabel='测绘几何画布'}:{layers:MapLayer[];ariaLabel?:string}){
+export function SurveyCanvas({layers,ariaLabel='测绘几何画布',onPickPoint,pickCursor}:{layers:MapLayer[];ariaLabel?:string;onPickPoint?:(point:Position)=>void;pickCursor?:boolean}){
   const canvasRef=useRef<HTMLCanvasElement>(null);const hostRef=useRef<HTMLDivElement>(null)
+  const pickRef=useRef(onPickPoint);pickRef.current=onPickPoint
   useEffect(()=>{
     const canvas=canvasRef.current,host=hostRef.current;if(!canvas||!host)return
     const draw=()=>{
@@ -17,10 +18,21 @@ export function SurveyCanvas({layers,ariaLabel='测绘几何画布'}:{layers:Map
       const bounds=geometryBounds(layers.map(layer=>layer.feature));if(!bounds){context.fillStyle='#617475';context.font='14px sans-serif';context.fillText('等待几何证据',24,36);return}
       let{minX,maxX,minY,maxY}=bounds;if(maxX===minX){maxX+=1;minX-=1}if(maxY===minY){maxY+=1;minY-=1}
       const padding=32,scale=Math.min((width-padding*2)/(maxX-minX),(height-padding*2)/(maxY-minY));const project=(point:Position):Position=>[padding+(point[0]-minX)*scale,height-padding-(point[1]-minY)*scale]
+      ;(canvas as HTMLCanvasElement & {__unproject?:(pixel:Position)=>Position}).__unproject=(pixel:Position):Position=>[(pixel[0]-padding)/scale+minX,(height-padding-pixel[1])/scale+minY]
       layers.forEach(layer=>{context.strokeStyle=layer.color;context.fillStyle=layer.fill??'transparent';context.lineWidth=layer.width??2;context.setLineDash(layer.dash??[]);geometryLines(layer.feature).forEach(line=>{if(!line.length)return;context.beginPath();line.forEach((point,index)=>{const [x,y]=project(point);if(index===0)context.moveTo(x,y);else context.lineTo(x,y)});if(layer.feature.geometry.type.includes('Polygon'))context.closePath();if(layer.fill)context.fill();context.stroke()})});context.setLineDash([])
       context.fillStyle='#415b5c';context.font='11px ui-monospace, monospace';context.fillText(`${minX.toFixed(0)} m`,padding,height-10);context.textAlign='right';context.fillText(`${maxX.toFixed(0)} m`,width-padding,height-10);context.textAlign='left'
     }
     draw();const observer=new ResizeObserver(draw);observer.observe(host);return()=>observer.disconnect()
   },[layers])
-  return <Box ref={hostRef} className="survey-canvas" role="img" aria-label={ariaLabel}><canvas ref={canvasRef}/></Box>
+  useEffect(()=>{
+    const canvas=canvasRef.current;if(!canvas)return
+    const handleClick=(event:MouseEvent)=>{
+      if(!pickRef.current)return
+      const rect=canvas.getBoundingClientRect()
+      const unproject=(canvas as HTMLCanvasElement & {__unproject?:(pixel:Position)=>Position}).__unproject
+      if(unproject)pickRef.current(unproject([event.clientX-rect.left,event.clientY-rect.top]))
+    }
+    canvas.addEventListener('click',handleClick);return()=>canvas.removeEventListener('click',handleClick)
+  },[])
+  return <Box ref={hostRef} className="survey-canvas" role="img" aria-label={ariaLabel} sx={pickCursor?{'& canvas':{cursor:'crosshair'}}:undefined}><canvas ref={canvasRef}/></Box>
 }
